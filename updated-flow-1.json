@@ -1,0 +1,641 @@
+{
+    "nodes": [
+      {
+        "parameters": {
+          "jsCode": "const s = $getWorkflowStaticData('global');\n\nconst now = new Date();\nconst overlapMs = 60 * 1000; // 60 sec overlap\n\n// First run fallback: last 15 minutes\nconst last = s.lastCheckedTime ? new Date(s.lastCheckedTime) : new Date(now.getTime() - 15 * 60 * 1000);\n\nconst since = new Date(last.getTime() - overlapMs);\n\nfunction fmt(d) {\n  const pad = (n) => String(n).padStart(2, '0');\n  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}_${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}_UTC`;\n}\n\nreturn [\n  {\n    json: {\n      targetAccount: 'deitaone',\n      sinceStr: fmt(since),\n      untilStr: fmt(now),\n      untilISO: now.toISOString()\n    }\n  }\n];\n"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -48,
+          -64
+        ],
+        "id": "9e15ef29-1e8a-48dc-a040-dbe5105095cb",
+        "name": "Build Time Window"
+      },
+      {
+        "parameters": {
+          "url": "https://api.twitterapi.io/twitter/tweet/advanced_search",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "queryType",
+                "value": "Latest"
+              },
+              {
+                "name": "query",
+                "value": "={{`from:${$json.targetAccount} since:${$json.sinceStr} until:${$json.untilStr} -filter:replies include:nativeretweets`}}"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "X-API-Key",
+                "value": "={{$vars.TWITTERAPI_IO_API_KEY}}"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 300000
+          }
+        },
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 3,
+        "position": [
+          176,
+          -64
+        ],
+        "id": "984d7a33-52e1-4a11-9640-3ab23a8892c4",
+        "name": "TwitterAPI Advanced Search"
+      },
+      {
+        "parameters": {
+          "jsCode": "// Pull-mode normalize (Advanced Search)\n// Adds \"priority-group\" rule fields to match old Rules/Webhook format\n\nconst raw = $input.first().json;\nconst data = raw;\nconst tweets = data.tweets ?? [];\n\nconsole.log(`=== Pull Path: Found ${tweets.length} tweets ===`);\n\nif (tweets.length === 0) {\n  return [];\n}\n\n// OPTIONAL: if you want these dynamic later, move them to Build Time Window node\nconst RULE_ID = data.rule_id || \"\"; // advanced_search usually won't provide this\nconst RULE_TAG = \"priority-group\";\nconst RULE_VALUE = \"from:deitaone -filter:replies\";\nconst EVENT_TYPE = \"tweet\";\n\nconst nowISO = new Date().toISOString();\n\nconst result = tweets.map((tweet) => {\n  const tweetId = tweet.tweetId || tweet.id || \"\";\n  const mainText = tweet.mainText || tweet.text || \"\";\n\n  const quotedText = tweet.quotedText || tweet.quoted_tweet?.text || \"\";\n  const quotedAuthor =\n    tweet.quotedAuthor || tweet.quoted_tweet?.author?.userName || \"\";\n  const quotedUrl = tweet.quotedUrl || tweet.quoted_tweet?.url || \"\";\n\n  return {\n    json: {\n      // Keep ingestion timestamp (when n8n processed it)\n      timestamp: nowISO,\n\n      tweetId,\n      tweetUrl: tweet.tweetUrl || tweet.url || \"\",\n      mainText,\n\n      quotedText,\n      quotedAuthor,\n      quotedUrl,\n      hasQuote: quotedText.length > 0,\n\n      images: tweet.images || [],\n      imageCount: tweet.imageCount || 0,\n\n      authorUsername: tweet.authorUsername || tweet.author?.userName || \"unknown\",\n      authorName: tweet.authorName || tweet.author?.name || \"\",\n      authorFollowers: tweet.authorFollowers || tweet.author?.followers || 0,\n      authorVerified: tweet.authorVerified || tweet.author?.isVerified || false,\n      authorBlueVerified:\n        tweet.authorBlueVerified || tweet.author?.isBlueVerified || false,\n\n      likeCount: tweet.likeCount || 0,\n      retweetCount: tweet.retweetCount || 0,\n      replyCount: tweet.replyCount || 0,\n      viewCount: tweet.viewCount || 0,\n      quoteCount: tweet.quoteCount || 0,\n      bookmarkCount: tweet.bookmarkCount || 0,\n\n      isReply: tweet.isReply || false,\n      inReplyToId: tweet.inReplyToId || \"\",\n      conversationId: tweet.conversationId || \"\",\n\n      // Real tweet creation time from Twitter\n      createdAt: tweet.createdAt || \"\",\n\n      lang: tweet.lang || \"\",\n      source: tweet.source || \"\",\n\n      // Force same \"rule\" columns as old webhook rows\n      ruleId: RULE_ID,\n      ruleTag: RULE_TAG,\n      ruleValue: RULE_VALUE,\n      eventType: EVENT_TYPE,\n\n      // Match your old sheet behavior\n      processed: true,\n\n      // When we ingested it\n      ingestedAt: nowISO\n    }\n  };\n});\n\nreturn result;\n"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          400,
+          -64
+        ],
+        "id": "d564f65c-e9b2-4e8b-89ff-7ae75f94d775",
+        "name": "Flatten & Normalize (Pull)"
+      },
+      {
+        "parameters": {
+          "jsCode": "try {\n  const workflowStaticData = $getWorkflowStaticData('global');\n  if (!workflowStaticData.seen || typeof workflowStaticData.seen !== 'object') {\n    workflowStaticData.seen = {};\n  }\n\n  const seen = workflowStaticData.seen;\n  const output = [];\n  const allItems = $input.all();\n\n  if (!allItems || allItems.length === 0) return [];\n\n  const localSeen = new Set();\n\n  for (const item of allItems) {\n    const tweetId = item?.json?.tweetId || item?.json?.id;\n    if (!tweetId || typeof tweetId !== 'string' || !tweetId.trim()) continue;\n\n    if (localSeen.has(tweetId) || seen[tweetId]) continue;\n\n    localSeen.add(tweetId);\n    seen[tweetId] = true;\n\n    output.push(item);\n  }\n\n  return output;\n} catch (error) {\n  console.error('Dedup error:', error.message);\n  return [];\n}\n"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          608,
+          -64
+        ],
+        "id": "39070af7-1f5c-4ca2-9df5-0b53f17936a6",
+        "name": "Deduplicate"
+      },
+      {
+        "parameters": {
+          "authentication": "serviceAccount",
+          "operation": "appendOrUpdate",
+          "documentId": {
+            "__rl": true,
+            "value": "1DSOpvhgPy-iCDgeaDfJCdPrRPph4AN_aixM6RFB5KUs",
+            "mode": "id"
+          },
+          "sheetName": {
+            "__rl": true,
+            "value": "all_tweets",
+            "mode": "name"
+          },
+          "columns": {
+            "mappingMode": "autoMapInputData",
+            "value": {},
+            "matchingColumns": [
+              "tweetId"
+            ],
+            "schema": [
+              {
+                "id": "timestamp",
+                "displayName": "timestamp",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "tweetId",
+                "displayName": "tweetId",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "tweetUrl",
+                "displayName": "tweetUrl",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "mainText",
+                "displayName": "mainText",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "quotedText",
+                "displayName": "quotedText",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "quotedAuthor",
+                "displayName": "quotedAuthor",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "quotedUrl",
+                "displayName": "quotedUrl",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "hasQuote",
+                "displayName": "hasQuote",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "images",
+                "displayName": "images",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "imageCount",
+                "displayName": "imageCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "authorUsername",
+                "displayName": "authorUsername",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "authorName",
+                "displayName": "authorName",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "authorFollowers",
+                "displayName": "authorFollowers",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "authorVerified",
+                "displayName": "authorVerified",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "authorBlueVerified",
+                "displayName": "authorBlueVerified",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "likeCount",
+                "displayName": "likeCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "retweetCount",
+                "displayName": "retweetCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "replyCount",
+                "displayName": "replyCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "viewCount",
+                "displayName": "viewCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "quoteCount",
+                "displayName": "quoteCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "bookmarkCount",
+                "displayName": "bookmarkCount",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "isReply",
+                "displayName": "isReply",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "inReplyToId",
+                "displayName": "inReplyToId",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "conversationId",
+                "displayName": "conversationId",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "createdAt",
+                "displayName": "createdAt",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "lang",
+                "displayName": "lang",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "source",
+                "displayName": "source",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "ruleId",
+                "displayName": "ruleId",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "ruleTag",
+                "displayName": "ruleTag",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "ruleValue",
+                "displayName": "ruleValue",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "eventType",
+                "displayName": "eventType",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "processed",
+                "displayName": "processed",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "ingestedAt",
+                "displayName": "ingestedAt",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "ok",
+                "displayName": "ok",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "result",
+                "displayName": "result",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "id": "processedAt",
+                "displayName": "processedAt",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              }
+            ],
+            "attemptToConvertTypes": false,
+            "convertFieldsToString": false
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.googleSheets",
+        "typeVersion": 4.7,
+        "position": [
+          832,
+          -64
+        ],
+        "id": "4beefae7-f7b9-4f6b-8028-c90f7d50b399",
+        "name": "Save to Sheets",
+        "credentials": {
+          "googleApi": {
+            "id": "XnsLYeVYt8ICZWSd",
+            "name": "Twitter-bot-sheet"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "jsCode": "// Run once per batch: output exactly ONE item\nreturn [{ json: { trigger: true } }];"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1056,
+          -64
+        ],
+        "id": "fb2ab694-d237-44d8-aec2-5660edf7d53a",
+        "name": "Single Trigger Item"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://infrasingularity.app.n8n.cloud/webhook/b128b420-b908-4d65-81bd-33ec6170a3d7",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={\"trigger\": true}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 3,
+        "position": [
+          1280,
+          -64
+        ],
+        "id": "5841b663-ef3a-4a6f-b0e4-8fb8acd618cb",
+        "name": "Trigger Slow Path"
+      },
+      {
+        "parameters": {
+          "jsCode": "const s = $getWorkflowStaticData('global');\n\nconst windowItem = $items('Build Time Window', 0, 0)?.json;\n\nif (windowItem?.untilISO) {\n  s.lastCheckedTime = windowItem.untilISO;\n}\n\nreturn [{ json: { ok: true, updatedLastCheckedTime: s.lastCheckedTime || null, saved: $input.all().length } }];\n"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1488,
+          -64
+        ],
+        "id": "3b3e3b02-9459-4f0f-a80a-4551fbf78adc",
+        "name": "Update Checkpoint"
+      },
+      {
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "hours"
+              }
+            ]
+          }
+        },
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.2,
+        "position": [
+          -272,
+          -64
+        ],
+        "id": "64113914-7873-4c7a-8039-91ebcb7681c2",
+        "name": "Schedule Trigger"
+      }
+    ],
+    "connections": {
+      "Build Time Window": {
+        "main": [
+          [
+            {
+              "node": "TwitterAPI Advanced Search",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "TwitterAPI Advanced Search": {
+        "main": [
+          [
+            {
+              "node": "Flatten & Normalize (Pull)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Flatten & Normalize (Pull)": {
+        "main": [
+          [
+            {
+              "node": "Deduplicate",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Deduplicate": {
+        "main": [
+          [
+            {
+              "node": "Save to Sheets",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Save to Sheets": {
+        "main": [
+          [
+            {
+              "node": "Single Trigger Item",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Single Trigger Item": {
+        "main": [
+          [
+            {
+              "node": "Trigger Slow Path",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Trigger Slow Path": {
+        "main": [
+          [
+            {
+              "node": "Update Checkpoint",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Schedule Trigger": {
+        "main": [
+          [
+            {
+              "node": "Build Time Window",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": true,
+      "instanceId": "4524a3d5cee94794c19029a2f41ac71fc224ea22bfcad0df1cf3c5532dd488b5"
+    }
+  }

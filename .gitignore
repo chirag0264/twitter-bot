@@ -1,0 +1,7 @@
+
+node_modules
+dist
+.env
+
+# Ignore exported n8n workflows
+n8n/
