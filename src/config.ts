@@ -7,7 +7,9 @@ type EnvKey =
   | 'MONGO_DB_NAME'
   | 'TWITTERAPI_IO_API_KEY'
   | 'GROK_API_KEY'
-  | 'TELEGRAM_BOT_TOKEN';
+  | 'TELEGRAM_BOT_TOKEN'
+  | 'CRON_INTERVAL_MINUTES'
+  | 'SLOW_PATH_INTERVAL_MINUTES';
 
 function requireEnv(key: EnvKey): string {
   const value = process.env[key];
@@ -38,6 +40,7 @@ export const config = {
   telegramAlertChatId: process.env.TELEGRAM_ALERT_CHAT_ID ?? '',
   watchdogSilentHours: Number(process.env.WATCHDOG_SILENT_HOURS ?? '2'),
   cronIntervalMinutes: Number(process.env.CRON_INTERVAL_MINUTES ?? '3'),
+  slowPathIntervalMinutes: Number(process.env.SLOW_PATH_INTERVAL_MINUTES ?? '2'),
   watchdogAlertCooldownMinutes: Number(
     process.env.WATCHDOG_ALERT_COOLDOWN_MINUTES ?? '60'
   ),

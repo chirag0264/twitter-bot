@@ -4,10 +4,11 @@
   "description": "Twitter breaking-news backend (Mongo + Grok + Telegram)",
   "main": "dist/index.js",
   "scripts": {
-    "start": "ts-node src/index.ts",
+    "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "build": "tsc",
-    "backfill": "ts-node src/backfillOnce.ts"
+    "backfill": "ts-node src/backfillOnce.ts",
+    "slow-path": "ts-node src/runSlowPathOnce.ts"
   },
   "dependencies": {
     "axios": "^1.7.7",

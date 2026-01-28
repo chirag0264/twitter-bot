@@ -145,6 +145,16 @@ export async function analyzeTweetsWithGrok(
 
   const prompt = buildPrompt(tweets);
 
+   // Optional sampling controls (match n8n settings if you know them)
+  const temperature =
+    process.env.GROK_TEMPERATURE !== undefined
+      ? Number(process.env.GROK_TEMPERATURE)
+      : undefined;
+  const topP =
+    process.env.GROK_TOP_P !== undefined
+      ? Number(process.env.GROK_TOP_P)
+      : undefined;
+
   const res = await axios.post(
     GROK_API_URL,
     {
@@ -155,6 +165,8 @@ export async function analyzeTweetsWithGrok(
           content: prompt,
         },
       ],
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(topP !== undefined ? { top_p: topP } : {}),
     },
     {
       headers: {

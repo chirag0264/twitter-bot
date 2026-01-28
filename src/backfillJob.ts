@@ -33,6 +33,13 @@ export async function runBackfillOnce(hours: number): Promise<void> {
     `[backfill] Found ${normalized.length} tweets from API in backfill window`
   );
 
+  const normalizedTweetIds = normalized.map((t) => t.tweetId);
+  if (normalizedTweetIds.includes('2016145532821918064')) {
+    console.log(`[backfill] ✅ Target tweet 2016145532821918064 found in normalized results`);
+  } else {
+    console.log(`[backfill] ❌ Target tweet 2016145532821918064 NOT in normalized results`);
+  }
+
   const inserted = await deduplicateAndInsert(normalized);
   console.log(`[backfill] Inserted ${inserted} new tweets into Mongo`);
 
