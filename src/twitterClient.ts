@@ -45,8 +45,9 @@ export async function searchLatest(params: {
   const allTweets: any[] = [];
   let nextCursor: string | undefined = undefined;
   let pageCount = 0;
+  const MAX_PAGES = 2; // Limit to 2 pages to avoid runaway costs
 
-  while (true) {
+  while (pageCount < MAX_PAGES) {
     // Rate limit: free tier allows 1 request per 5 seconds
     // Wait before making request (except for first page)
     if (pageCount > 0) {
@@ -64,36 +65,53 @@ export async function searchLatest(params: {
       requestParams.cursor = nextCursor;
     }
 
-    const res = await axios.get<TwitterSearchResponse>(url, {
-      params: requestParams,
-      headers: {
-        'X-API-Key': config.twitterApiKey,
-      },
-      timeout: 300_000,
-    });
+    try {
+      const res = await axios.get<TwitterSearchResponse>(url, {
+        params: requestParams,
+        headers: {
+          'X-API-Key': config.twitterApiKey,
+        },
+        timeout: 300_000,
+      });
 
-    const tweets = res.data.tweets || [];
-    allTweets.push(...tweets);
+      const tweets = res.data.tweets || [];
+      allTweets.push(...tweets);
 
-    console.log(`[twitter] Page ${pageCount}: ${tweets.length} tweets (total so far: ${allTweets.length})`);
+      console.log(`[twitter] Page ${pageCount}: ${tweets.length} tweets (total so far: ${allTweets.length})`);
 
-    // Check if there are more pages
-    // Must have: has_next_page === true AND a valid non-empty next_cursor
-    const hasMorePages = res.data.has_next_page === true;
-    const hasValidCursor = res.data.next_cursor && 
-                          typeof res.data.next_cursor === 'string' && 
-                          res.data.next_cursor.trim() !== '';
+      // Check if there are more pages
+      // Must have: has_next_page === true AND a valid non-empty next_cursor
+      const hasMorePages = res.data.has_next_page === true;
+      const hasValidCursor = res.data.next_cursor && 
+                            typeof res.data.next_cursor === 'string' && 
+                            res.data.next_cursor.trim() !== '';
 
-    if (hasMorePages && hasValidCursor) {
-      nextCursor = res.data.next_cursor;
-      console.log(`[twitter] More pages available, continuing pagination...`);
-      continue;
-    } else {
-      if (!hasMorePages) {
-        console.log(`[twitter] No more pages (has_next_page: ${res.data.has_next_page})`);
-      } else if (!hasValidCursor) {
-        console.log(`[twitter] No more pages (invalid/empty next_cursor)`);
+      if (hasMorePages && hasValidCursor && pageCount < MAX_PAGES) {
+        nextCursor = res.data.next_cursor;
+        console.log(`[twitter] More pages available, continuing pagination...`);
+        continue;
+      } else {
+        if (!hasMorePages) {
+          console.log(`[twitter] No more pages (has_next_page: ${res.data.has_next_page})`);
+        } else if (!hasValidCursor) {
+          console.log(`[twitter] No more pages (invalid/empty next_cursor)`);
+        } else if (pageCount >= MAX_PAGES) {
+          console.log(`[twitter] Max page limit (${MAX_PAGES}) reached, stopping pagination`);
+        }
+        break;
       }
+    } catch (error: any) {
+      // Handle errors (rate limits, network issues, etc.)
+      console.error(`[twitter] Error on page ${pageCount}:`, error.message);
+      if (error.response) {
+        console.error(`[twitter] API returned status ${error.response.status}`);
+        if (error.response.status === 429) {
+          console.error(`[twitter] Rate limit hit - TwitterAPI.io charges 300 credits per error!`);
+        }
+        console.error(`[twitter] Response data:`, JSON.stringify(error.response.data, null, 2));
+      }
+      // Break pagination on error to avoid runaway costs
+      console.log(`[twitter] Stopping pagination due to error`);
       break;
     }
   }
@@ -101,12 +119,6 @@ export async function searchLatest(params: {
   const tweetIds = allTweets.map((t: any) => t.tweetId || t.id || 'unknown');
   console.log(`[twitter] Total API returned ${allTweets.length} tweets across ${pageCount} page(s)`);
   console.log(`[twitter] Tweet IDs: ${tweetIds.slice(0, 10).join(', ')}${tweetIds.length > 10 ? '...' : ''}`);
-  
-  if (tweetIds.includes('2016145532821918064')) {
-    console.log(`[twitter] ✅ Found target tweet 2016145532821918064 in API response`);
-  } else {
-    console.log(`[twitter] ❌ Target tweet 2016145532821918064 NOT in API response`);
-  }
 
   return {
     tweets: allTweets,

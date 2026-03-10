@@ -15,10 +15,26 @@ function isPriorityTag(tag?: string): boolean {
   return lower.includes('priority');
 }
 
+function buildContextBlock(
+  alerts: { MainText?: string; ImpactLine?: string; Reason?: string }[]
+): string {
+  if (alerts.length === 0) return '';
+  const lines = alerts.map(
+    (a) =>
+      `- "${(a.MainText || '').slice(0, 120)}${(a.MainText || '').length > 120 ? '...' : ''}" | ${a.ImpactLine || a.Reason || ''}`
+  );
+  return `## ALREADY SENT — PRICED IN (last 3 days, newest first)
+Treat these topics as established/priced-in. Only flag a NEW MATERIAL DEVELOPMENT.
+${lines.join('\n')}
+
+If a tweet is a routine update on any of these topics, breaking: []`;
+}
+
 export async function runSlowPathOnce(): Promise<void> {
   const db = await getDb();
   const tweetsCol = db.collection<TweetDoc>('tweets');
   const analysesCol = db.collection('analyses');
+  const alertsCol = db.collection<AlertRow>('alerts');
 
   const allItems = await tweetsCol
     .find({ processed: false })
@@ -100,6 +116,17 @@ export async function runSlowPathOnce(): Promise<void> {
 
   console.log(`Created ${batches.length} batch(es)`);
 
+  const threeDaysAgo = new Date(
+    Date.now() - 3 * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const recentAlerts = await alertsCol
+    .find({ Timestamp: { $gte: threeDaysAgo } })
+    .sort({ Timestamp: -1 })
+    .limit(30)
+    .project({ MainText: 1, ImpactLine: 1, Reason: 1 })
+    .toArray() as { MainText?: string; ImpactLine?: string; Reason?: string }[];
+  const context = buildContextBlock(recentAlerts);
+
   const allBreakingArrays: any[][] = [];
   const analyzedTweetIds = new Set<string>();
 
@@ -110,7 +137,7 @@ export async function runSlowPathOnce(): Promise<void> {
       if (t.tweetId) analyzedTweetIds.add(t.tweetId);
     });
 
-    const rawResponse = await analyzeTweetsWithGrok(batchTweets);
+    const rawResponse = await analyzeTweetsWithGrok(batchTweets, context);
     const parsed = parseGrokResponse(rawResponse);
     allBreakingArrays.push(parsed.breaking);
 
@@ -134,12 +161,28 @@ export async function runSlowPathOnce(): Promise<void> {
 
   const alerts: AlertRow[] = flattenBreakingItems(allBreakingArrays);
 
+  // Cross-run dedup: only insert and send alerts not already in DB
+  let deduped = alerts;
   if (alerts.length > 0) {
-    const alertsCol = db.collection<AlertRow>('alerts');
-    await alertsCol.insertMany(alerts, { ordered: false });
+    const newAlertTweetIds = alerts.map((a) => a.TweetId);
+    const existing = await alertsCol
+      .find({ TweetId: { $in: newAlertTweetIds } })
+      .project({ TweetId: 1 })
+      .toArray();
+    const existingIds = new Set(existing.map((e) => e.TweetId));
+    deduped = alerts.filter((a) => !existingIds.has(a.TweetId));
+    if (deduped.length < alerts.length) {
+      console.log(
+        `[slow-path] Skipping ${alerts.length - deduped.length} alerts already sent (cross-run dedup)`
+      );
+    }
+  }
+
+  if (deduped.length > 0) {
+    await alertsCol.insertMany(deduped, { ordered: false });
 
     if (config.telegramAlertChatId) {
-      for (const a of alerts) {
+      for (const a of deduped) {
         const icon =
           a.Urgency === 'high'
             ? '🔴'
@@ -162,7 +205,6 @@ export async function runSlowPathOnce(): Promise<void> {
         textLines.push(
           '',
           `👤 @${a.Username}`,
-          `📊 ${a.Reason}`,
           '',
           `🔗 ${a.Link}`
         );

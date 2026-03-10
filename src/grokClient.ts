@@ -8,7 +8,10 @@ const GROK_MODEL = 'grok-4-1-fast-reasoning';
 // You may need to adjust the URL/shape to match your xAI account.
 const GROK_API_URL = process.env.GROK_API_URL || 'https://api.x.ai/v1/chat/completions';
 
-function buildPrompt(tweets: NormalizedTweet[]): string {
+function buildPrompt(
+  tweets: NormalizedTweet[],
+  context?: string
+): string {
   const tweetsJson = JSON.stringify(
     tweets.map((t) => ({
       mainText: t.mainText,
@@ -21,8 +24,12 @@ function buildPrompt(tweets: NormalizedTweet[]): string {
     }))
   );
 
-  return `
-You are a CRYPTO MARKET breaking-news detector. Focus ONLY on news that can realistically move cryptocurrency prices in the next 0–48 hours.
+  const contextBlock =
+    context && context.trim()
+      ? `${context.trim()}\n\n`
+      : '';
+
+  return `${contextBlock}You are a CRYPTO MARKET breaking-news detector. Focus ONLY on news that can realistically move cryptocurrency prices in the next 0–48 hours.
 
 Here are new tweets from accounts I follow:
 ${tweetsJson}
@@ -110,7 +117,7 @@ Output ONLY strict JSON:
         "mainText": "author's reaction/comment",
         "quotedText": "quoted content (empty string if none)",
         "quotedAuthor": "quoted author username (empty string if none)",
-        "reason": "why breaking and how it impacts crypto markets",
+        "impact_line": "one short sentence: why breaking and crypto impact (e.g. risk-off; BTC/ETH sell-off risk 0-48h)",
         "urgency": "low|medium|high",
         "username": "main author username",
         "tweet_id": "tweet id",
@@ -130,6 +137,7 @@ Rules:
 - tweet_id MUST equal the input tweetId exactly (use the tweetId field from the input tweet object)
 - Analyze BOTH mainText AND quotedText together for context
 - For quotes, include BOTH mainText and quotedText in breaking object
+- impact_line: one short sentence only (used for context later); no long explanation
 - NO markdown, NO code blocks, NO explanations
 - MUST be valid JSON
 - Same order as input
@@ -137,13 +145,14 @@ Rules:
 }
 
 export async function analyzeTweetsWithGrok(
-  tweets: NormalizedTweet[]
+  tweets: NormalizedTweet[],
+  context?: string
 ): Promise<any> {
   if (!config.grokApiKey) {
     throw new Error('GROK_API_KEY is not set');
   }
 
-  const prompt = buildPrompt(tweets);
+  const prompt = buildPrompt(tweets, context);
 
    // Optional sampling controls (match n8n settings if you know them)
   const temperature =

@@ -4,7 +4,7 @@ interface BreakingItem {
   mainText?: string;
   quotedText?: string;
   quotedAuthor?: string;
-  reason?: string;
+  impact_line?: string;
   urgency?: string;
   username?: string;
   tweet_id?: string;
@@ -18,7 +18,7 @@ export interface AlertRow {
   MainText: string;
   QuotedText: string;
   QuotedAuthor: string;
-  Reason: string;
+  ImpactLine: string;
   Urgency: string;
   Username: string;
   Link: string;
@@ -48,7 +48,7 @@ export function flattenBreakingItems(breakingArrays: BreakingItem[][]): AlertRow
         MainText: b.mainText || '',
         QuotedText: quotedText,
         QuotedAuthor: b.quotedAuthor || '',
-        Reason: b.reason || '',
+        ImpactLine: b.impact_line || '',
         Urgency: b.urgency || 'medium',
         Username: b.username || '',
         Link: b.link || '',
