@@ -8,6 +8,23 @@ const GROK_MODEL = 'grok-4-1-fast-reasoning';
 // You may need to adjust the URL/shape to match your xAI account.
 const GROK_API_URL = process.env.GROK_API_URL || 'https://api.x.ai/v1/chat/completions';
 
+/**
+ * Permanent one-story rule: no situation list to maintain.
+ * Applies to any major ongoing event (war, crisis, supply shock).
+ */
+const ONE_STORY_RULE = `
+## ONE-STORY RULE (apply to ANY major ongoing event)
+
+For any major ongoing story (war, conflict, supply shock, crisis):
+- Only the FIRST major development is breaking (e.g. war starts, chokepoint closes, first big strike).
+- After that, only flag if the news is a MATERIAL NEW development that changes the story, e.g.:
+  - Conflict ends (ceasefire, peace deal) or formally escalates (new country enters, Article 5).
+  - Chokepoint/critical infrastructure actually reopens or is actually shut (not just statements).
+  - New hard data that materially worsens the situation (e.g. confirmed large export drop, oil above new threshold).
+  - Nuclear or other game-changing dimension confirmed.
+- Routine updates on the SAME story = NOT breaking: more strikes, more statements, evacuation warnings, "expanding scope", attacks on facilities in the same conflict, threats, asking allies for help. If it's "more of the same", breaking: [].
+`.trim();
+
 function buildPrompt(
   tweets: NormalizedTweet[],
   context?: string
@@ -29,7 +46,7 @@ function buildPrompt(
       ? `${context.trim()}\n\n`
       : '';
 
-  return `${contextBlock}You are a CRYPTO MARKET breaking-news detector. Focus ONLY on news that can realistically move cryptocurrency prices in the next 0–48 hours.
+  return `${ONE_STORY_RULE}\n\n${contextBlock}You are a CRYPTO MARKET breaking-news detector. Focus ONLY on news that can realistically move cryptocurrency prices in the next 0–48 hours.
 
 Here are new tweets from accounts I follow:
 ${tweetsJson}
