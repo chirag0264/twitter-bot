@@ -10,19 +10,27 @@ const GROK_API_URL = process.env.GROK_API_URL || 'https://api.x.ai/v1/chat/compl
 
 /**
  * Permanent one-story rule: no situation list to maintain.
- * Applies to any major ongoing event (war, crisis, supply shock).
+ * Stricter: only structural changes are breaking; everything else is routine.
  */
 const ONE_STORY_RULE = `
 ## ONE-STORY RULE (apply to ANY major ongoing event)
 
 For any major ongoing story (war, conflict, supply shock, crisis):
 - Only the FIRST major development is breaking (e.g. war starts, chokepoint closes, first big strike).
-- After that, only flag if the news is a MATERIAL NEW development that changes the story, e.g.:
-  - Conflict ends (ceasefire, peace deal) or formally escalates (new country enters, Article 5).
-  - Chokepoint/critical infrastructure actually reopens or is actually shut (not just statements).
-  - New hard data that materially worsens the situation (e.g. confirmed large export drop, oil above new threshold).
+- After that, ONLY flag if the story STRUCTURALLY changes:
+  - Conflict ends (ceasefire, peace deal) or a new state formally enters the war (e.g. Article 5 invoked).
+  - Chokepoint actually reopens or is formally shut (official/confirmed, not statements or "post removed").
+  - New hard data that materially worsens supply (e.g. confirmed large export drop, oil above new threshold).
   - Nuclear or other game-changing dimension confirmed.
-- Routine updates on the SAME story = NOT breaking: more strikes, more statements, evacuation warnings, "expanding scope", attacks on facilities in the same conflict, threats, asking allies for help. If it's "more of the same", breaking: [].
+- Everything else in the SAME conflict = NOT breaking (breaking: []):
+  - More strikes, more ship attacks, mines laid in chokepoint, more targets hit (ships, ports, facilities).
+  - Leadership hurt/injured/dead (same regime, same conflict; not a formal regime change).
+  - Strikes in new city/country in same region (e.g. Oman, new port) — still same conflict.
+  - Warnings about new targets (e.g. FBI warning about California, evacuation warnings).
+  - External actor aiding (e.g. Russia sharing tactics) — supporting same conflict, not new state entering.
+  - Mistakes/collateral (e.g. school struck) — tragic but same conflict.
+  - Statements, removed posts, envoy comments, pollutants, evacuation orders.
+If it's still "same war, more headlines", breaking: [].
 `.trim();
 
 function buildPrompt(
