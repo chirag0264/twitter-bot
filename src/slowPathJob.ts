@@ -27,7 +27,39 @@ function buildContextBlock(
 Treat these topics as established/priced-in. Only flag a NEW MATERIAL DEVELOPMENT.
 ${lines.join('\n')}
 
-If a tweet is a routine update on any of these topics, breaking: []`;
+If a post is a routine update on any of these topics, breaking: []`;
+}
+
+function toUsTradingDay(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+}
+
+function buildDeterministicKeys(a: AlertRow): string[] {
+  const text = `${a.MainText || ''} ${a.QuotedText || ''}`.toLowerCase();
+  const isEquityCrashSignal =
+    /(?:crash|correction|sell-?off|biggest daily|7-month low|records? biggest|wiping out|down\s*\d+(?:\.\d+)?%|drops?\s*\d+(?:\.\d+)?%)/i.test(
+      text
+    );
+  if (!isEquityCrashSignal) return [];
+
+  const day = toUsTradingDay(a.Timestamp || new Date().toISOString());
+  if (!day) return [];
+
+  const keys: string[] = [];
+  if (/(?:s&p\s*500|sp500|spx|s and p 500)/i.test(text)) {
+    keys.push(`equity_crash|sp500|${day}`);
+  }
+  if (/(?:nasdaq\s*100|nasdaq100|ndx|nasdaq)/i.test(text)) {
+    keys.push(`equity_crash|nasdaq100|${day}`);
+  }
+  return keys;
 }
 
 export async function runSlowPathOnce(): Promise<void> {
@@ -126,9 +158,23 @@ export async function runSlowPathOnce(): Promise<void> {
     .project({ MainText: 1, ImpactLine: 1, Reason: 1 })
     .toArray() as { MainText?: string; ImpactLine?: string; Reason?: string }[];
   const context = buildContextBlock(recentAlerts);
+  let liveContext = context;
+  const withinRunAlerts: {
+    MainText?: string;
+    ImpactLine?: string;
+    Reason?: string;
+  }[] = [];
 
   const allBreakingArrays: any[][] = [];
   const analyzedTweetIds = new Set<string>();
+
+  const idToPlatform = new Map<string, 'twitter' | 'truth-social'>();
+  for (const t of limited) {
+    idToPlatform.set(
+      t.tweetId,
+      t.sourcePlatform === 'truth-social' ? 'truth-social' : 'twitter'
+    );
+  }
 
   for (const batch of batches) {
     const batchTweets = batch.map((t) => t as NormalizedTweet);
@@ -137,15 +183,28 @@ export async function runSlowPathOnce(): Promise<void> {
       if (t.tweetId) analyzedTweetIds.add(t.tweetId);
     });
 
-    const rawResponse = await analyzeTweetsWithGrok(batchTweets, context);
+    const rawResponse = await analyzeTweetsWithGrok(batchTweets, liveContext);
     const parsed = parseGrokResponse(rawResponse);
     allBreakingArrays.push(parsed.breaking);
+
+    // Feed newly found alerts back into context so later batches avoid repeats.
+    const batchAlerts = flattenBreakingItems([parsed.breaking]).map((a) => ({
+      MainText: a.MainText,
+      ImpactLine: a.ImpactLine,
+    }));
+    if (batchAlerts.length > 0) {
+      withinRunAlerts.push(...batchAlerts);
+      liveContext = buildContextBlock([...withinRunAlerts, ...recentAlerts]);
+    }
 
     // Persist analysis for debug/inspection
     try {
       await analysesCol.insertOne({
         createdAt: new Date().toISOString(),
         tweetIds: batchTweets.map((t) => t.tweetId),
+        sourcePlatforms: batchTweets.map(
+          (t) => t.sourcePlatform || 'twitter'
+        ),
         results: parsed.results,
         breaking: parsed.breaking,
         raw: rawResponse,
@@ -160,6 +219,9 @@ export async function runSlowPathOnce(): Promise<void> {
   }
 
   const alerts: AlertRow[] = flattenBreakingItems(allBreakingArrays);
+  for (const a of alerts) {
+    a.SourcePlatform = idToPlatform.get(a.TweetId) || 'twitter';
+  }
 
   // Cross-run dedup: only insert and send alerts not already in DB
   let deduped = alerts;
@@ -178,52 +240,94 @@ export async function runSlowPathOnce(): Promise<void> {
     }
   }
 
+  // Deterministic dedup for same-day major equity crash stories across accounts.
+  if (deduped.length > 0) {
+    for (const a of deduped) {
+      a.DeterministicKeys = buildDeterministicKeys(a);
+    }
+    const candidateKeys = Array.from(
+      new Set(deduped.flatMap((a) => a.DeterministicKeys || []))
+    );
+    if (candidateKeys.length > 0) {
+      const existingByKey = await alertsCol
+        .find({ DeterministicKeys: { $in: candidateKeys } })
+        .project({ DeterministicKeys: 1 })
+        .toArray() as { DeterministicKeys?: string[] }[];
+      const seenKeys = new Set<string>(
+        existingByKey.flatMap((e) => e.DeterministicKeys || [])
+      );
+      const kept: AlertRow[] = [];
+      for (const a of deduped) {
+        const keys = a.DeterministicKeys || [];
+        if (keys.length > 0 && keys.some((k) => seenKeys.has(k))) {
+          continue;
+        }
+        kept.push(a);
+        for (const k of keys) seenKeys.add(k);
+      }
+      if (kept.length < deduped.length) {
+        console.log(
+          `[slow-path] Skipping ${deduped.length - kept.length} alerts by deterministic same-day equity dedupe`
+        );
+      }
+      deduped = kept;
+    }
+  }
+
   if (deduped.length > 0) {
     await alertsCol.insertMany(deduped, { ordered: false });
 
-    if (config.telegramAlertChatId) {
-      for (const a of deduped) {
-        const icon =
-          a.Urgency === 'high'
-            ? '🔴'
-            : a.Urgency === 'medium'
-            ? '🟡'
-            : '🟢';
+    for (const a of deduped) {
+      const chatId =
+        a.SourcePlatform === 'truth-social'
+          ? config.telegramTruthSocialChatId
+          : config.telegramAlertChatId;
 
-        const textLines = [
-          `${icon} ${a.MainText}`,
-        ];
+      if (!chatId) {
+        console.warn(
+          `[slow-path] No Telegram chat for platform ${a.SourcePlatform || 'twitter'}; skipping send`
+        );
+        continue;
+      }
 
-        if (a.HasQuote && a.QuotedText) {
-          textLines.push(
-            '',
-            `📎 <b>Quoting @${a.QuotedAuthor}:</b>`,
-            a.QuotedText
-          );
-        }
+      const icon =
+        a.Urgency === 'high'
+          ? '🔴'
+          : a.Urgency === 'medium'
+          ? '🟡'
+          : '🟢';
 
+      const textLines: string[] = [];
+      if (a.SourcePlatform === 'truth-social') {
+        textLines.push('📣 <b>Truth Social</b>', '');
+      }
+      textLines.push(`${icon} ${a.MainText}`);
+
+      if (a.HasQuote && a.QuotedText) {
         textLines.push(
           '',
-          `👤 @${a.Username}`,
-          '',
-          `🔗 ${a.Link}`
+          `📎 <b>Quoting @${a.QuotedAuthor}:</b>`,
+          a.QuotedText
         );
-
-        if (a.QuotedLink) {
-          textLines.push(`📎 ${a.QuotedLink}`);
-        }
-
-        const message = textLines.join('\n');
-
-        await sendTelegramMessage({
-          chatId: config.telegramAlertChatId,
-          text: message,
-        });
       }
-    } else {
-      console.warn(
-        '[slow-path] TELEGRAM_ALERT_CHAT_ID not set; skipping breaking alerts to Telegram'
+
+      textLines.push(
+        '',
+        `👤 @${a.Username}`,
+        '',
+        `🔗 ${a.Link}`
       );
+
+      if (a.QuotedLink) {
+        textLines.push(`📎 ${a.QuotedLink}`);
+      }
+
+      const message = textLines.join('\n');
+
+      await sendTelegramMessage({
+        chatId,
+        text: message,
+      });
     }
   } else {
     console.log('No breaking alerts to send');

@@ -24,6 +24,10 @@ export interface AlertRow {
   Link: string;
   QuotedLink: string;
   HasQuote: boolean;
+  /** Deterministic server-side dedupe keys (optional). */
+  DeterministicKeys?: string[];
+  /** Set by slow path from source tweet; drives Telegram routing */
+  SourcePlatform?: 'twitter' | 'truth-social';
 }
 
 export function flattenBreakingItems(breakingArrays: BreakingItem[][]): AlertRow[] {

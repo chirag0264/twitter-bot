@@ -9,6 +9,7 @@ Node.js/TypeScript backend for monitoring Twitter accounts and detecting breakin
 - **Watchdog**: Monitors for silent periods and sends alerts
 - **MongoDB**: All data stored in MongoDB (tweets, alerts, analyses)
 - **Telegram**: Sends breaking news alerts to Telegram
+- **Truth Social**: RSS ingest for `@realdonaldtrump` (trumpstruth.org feed) writes into the same Mongo `tweets` collection as Twitter. The slow path (Grok) analyzes both; breaking items route to `TELEGRAM_TRUTH_SOCIAL_CHAT_ID` (Truth) or `TELEGRAM_ALERT_CHAT_ID` (Twitter).
 
 ## Setup
 
@@ -31,16 +32,22 @@ GROK_API_KEY="your_grok_api_key"
 TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
 
 # Optional (with defaults)
-PRIORITY_ACCOUNTS="deitaone"  # Comma-separated list
+PRIORITY_ACCOUNTS="deitaone,realdonaldtrump"  # Comma-separated; query is from:a OR from:b -filter:replies
 NORMAL_ACCOUNTS=""            # Comma-separated list
 TELEGRAM_WATCHDOG_CHAT_ID="1285567245"
 TELEGRAM_ALERT_CHAT_ID="-1003449247259"
+# Breaking alerts from Truth Social (RSS) go here; Twitter alerts use TELEGRAM_ALERT_CHAT_ID
+TELEGRAM_TRUTH_SOCIAL_CHAT_ID=""
+TRUTH_SOCIAL_POLL_MINUTES="5"
 WATCHDOG_SILENT_HOURS="2"
 WATCHDOG_ALERT_COOLDOWN_MINUTES="60"
 CRON_INTERVAL_MINUTES="3"           # Fast path interval
 SLOW_PATH_INTERVAL_MINUTES="2"      # Slow path interval
 GROK_TEMPERATURE="0"                # Grok temperature (0-1)
 GROK_TOP_P="1"                      # Grok top_p (0-1)
+# Optional: cap images sent to Grok 4.1 vision (http(s) URLs from tweets / Truth RSS)
+GROK_VISION_MAX_IMAGES="16"
+GROK_VISION_MAX_PER_POST="4"
 ```
 
 ### 3. Build

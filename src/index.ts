@@ -1,5 +1,6 @@
 import { getDb } from './mongo';
 import { runPullTweetsOnce } from './pullTweetsJob';
+import { runTruthSocialIngestOnce } from './truthSocialIngestJob';
 import { runSilentWatchdogOnce } from './silentWatchdogJob';
 import { runSlowPathOnce } from './slowPathJob';
 import cron from 'node-cron';
@@ -17,6 +18,12 @@ async function main() {
 
   // Run immediately once on startup
   await runPullTweetsOnce();
+  try {
+    await runTruthSocialIngestOnce();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[twitter-bot] Truth Social ingest on startup:', err);
+  }
   await runSilentWatchdogOnce();
   await runSlowPathOnce();
 
@@ -55,6 +62,24 @@ async function main() {
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[scheduler] Error in slow path:', err);
+    }
+  });
+
+  const truthMinutes = Math.max(
+    1,
+    Math.floor(config.truthSocialPollMinutes || 5)
+  );
+  const truthExpr = `*/${truthMinutes} * * * *`;
+  console.log(
+    `[scheduler] Truth Social RSS ingest: every ${truthMinutes} minute(s) - "${truthExpr}"`
+  );
+
+  cron.schedule(truthExpr, async () => {
+    try {
+      await runTruthSocialIngestOnce();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[scheduler] Error in Truth Social ingest:', err);
     }
   });
 

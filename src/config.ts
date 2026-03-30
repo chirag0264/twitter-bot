@@ -38,6 +38,11 @@ export const config = {
   normalAccounts: parseAccountList(process.env.NORMAL_ACCOUNTS),
   telegramWatchdogChatId: process.env.TELEGRAM_WATCHDOG_CHAT_ID ?? '',
   telegramAlertChatId: process.env.TELEGRAM_ALERT_CHAT_ID ?? '',
+  telegramTruthSocialChatId:
+    process.env.TELEGRAM_TRUTH_SOCIAL_CHAT_ID ?? '',
+  truthSocialPollMinutes: Number(
+    process.env.TRUTH_SOCIAL_POLL_MINUTES ?? '5'
+  ),
   watchdogSilentHours: Number(process.env.WATCHDOG_SILENT_HOURS ?? '2'),
   cronIntervalMinutes: Number(process.env.CRON_INTERVAL_MINUTES ?? '3'),
   slowPathIntervalMinutes: Number(process.env.SLOW_PATH_INTERVAL_MINUTES ?? '2'),

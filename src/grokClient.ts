@@ -4,79 +4,151 @@ import { NormalizedTweet } from './normalizeTweet';
 
 const GROK_MODEL = 'grok-4-1-fast-reasoning';
 
+/** Max images appended per request (xAI fetches URLs server-side). */
+const GROK_VISION_MAX_IMAGES = Number(
+  process.env.GROK_VISION_MAX_IMAGES ?? '16'
+);
+const GROK_VISION_MAX_PER_POST = Number(
+  process.env.GROK_VISION_MAX_PER_POST ?? '4'
+);
+
 // Minimal Grok client using xAI-style chat completions API.
 // You may need to adjust the URL/shape to match your xAI account.
 const GROK_API_URL = process.env.GROK_API_URL || 'https://api.x.ai/v1/chat/completions';
 
-/**
- * Permanent one-story rule: no situation list to maintain.
- * Stricter: only structural changes are breaking; everything else is routine.
- */
-const ONE_STORY_RULE = `
-## ONE-STORY RULE (apply to ANY major ongoing event)
+type ChatContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: string } };
 
-For any major ongoing story (war, conflict, supply shock, crisis):
-- Only the FIRST major development is breaking (e.g. war starts, chokepoint closes, first big strike).
-- After that, ONLY flag if the story STRUCTURALLY changes:
-  - Conflict ends (ceasefire, peace deal) or a new state formally enters the war (e.g. Article 5 invoked).
-  - Chokepoint actually reopens or is formally shut (official/confirmed, not statements or "post removed").
-  - New hard data that materially worsens supply (e.g. confirmed large export drop, oil above new threshold).
-  - Nuclear or other game-changing dimension confirmed.
-- Everything else in the SAME conflict = NOT breaking (breaking: []):
-  - More strikes, more ship attacks, mines laid in chokepoint, more targets hit (ships, ports, facilities).
-  - Leadership hurt/injured/dead (same regime, same conflict; not a formal regime change).
-  - Strikes in new city/country in same region (e.g. Oman, new port) — still same conflict.
-  - Warnings about new targets (e.g. FBI warning about California, evacuation warnings).
-  - External actor aiding (e.g. Russia sharing tactics) — supporting same conflict, not new state entering.
-  - Mistakes/collateral (e.g. school struck) — tragic but same conflict.
-  - Statements, removed posts, envoy comments, pollutants, evacuation orders.
-If it's still "same war, more headlines", breaking: [].
+function isHttpUrl(s: string): boolean {
+  return /^https?:\/\//i.test(s.trim());
+}
+
+/** Vision APIs expect raster images, not video attachments. */
+function isLikelyVideoUrl(u: string): boolean {
+  const path = u.split('?')[0].toLowerCase();
+  return /\.(mp4|webm|mov|m4v|mkv|mpeg)(\?|$)/.test(path);
+}
+
+/** Truth Social CDN often returns 403 to xAI's image fetcher — skip for vision. */
+function isLikelyBlockedVisionUrl(u: string): boolean {
+  return /static-assets[^/]*\.truthsocial\.com/i.test(u);
+}
+
+/**
+ * Build the vision attachment list in strict per-post order so the prompt's
+ * "each post's images correspond to that post's imageUrls" statement is exact.
+ *
+ * No cross-post dedup: if the same URL appears in two posts it is attached
+ * twice (rare in practice) so the model can map images ↔ posts reliably.
+ * Only caps applied: perPost per post, maxTotal globally.
+ */
+function collectVisionImageUrls(tweets: NormalizedTweet[]): string[] {
+  const maxTotal = Math.max(1, Math.min(32, GROK_VISION_MAX_IMAGES));
+  const perPost = Math.max(1, Math.min(8, GROK_VISION_MAX_PER_POST));
+  const out: string[] = [];
+
+  for (const t of tweets) {
+    const imgs = (t.images || []).filter(
+      (u) =>
+        isHttpUrl(u) &&
+        !isLikelyVideoUrl(u) &&
+        !isLikelyBlockedVisionUrl(u)
+    );
+    for (const u of imgs.slice(0, perPost)) {
+      out.push(u.trim());
+      if (out.length >= maxTotal) return out;
+    }
+  }
+  return out;
+}
+
+/** Crisp one-story rule: only structural changes in an ongoing story are breaking. */
+const ONE_STORY_RULE = `
+## ONE-STORY RULE
+For any major ongoing story (war, conflict, crisis): only the FIRST development is breaking. After that, flag ONLY a STRUCTURAL change: conflict ends/pauses (ceasefire, peace deal), new state formally enters (Article 5), chokepoint confirmed open/shut, nuclear dimension confirmed, or hard data materially worsens supply. Everything else — more strikes, leadership killed, new targets, statements, envoy comments — is NOT breaking (breaking: []).
+This rule applies to market events too: if multiple posts from different accounts report the same S&P500/Nasdaq100 crash on the same US trading day (ET session), only the FIRST is breaking; later posts adding percentages or dollar-loss figures are NOT breaking (breaking: []).
 `.trim();
 
 function buildPrompt(
   tweets: NormalizedTweet[],
-  context?: string
+  context?: string,
+  visionUrlsForBlock?: string[]
 ): string {
+  const visionUrls = visionUrlsForBlock ?? collectVisionImageUrls(tweets);
+  const perPost = Math.max(1, Math.min(8, GROK_VISION_MAX_PER_POST));
+
+  const trunc = (s: string | null | undefined, max = 1000): string =>
+    (s ?? '').slice(0, max);
+
   const tweetsJson = JSON.stringify(
-    tweets.map((t) => ({
-      mainText: t.mainText,
-      quotedText: t.quotedText,
-      quotedAuthor: t.quotedAuthor,
-      authorUsername: t.authorUsername,
-      tweetUrl: t.tweetUrl,
-      quotedUrl: t.quotedUrl,
-      tweetId: t.tweetId,
-    }))
+    tweets.map((t) => {
+      const imageUrls = (t.images || [])
+        .filter(
+          (u) =>
+            isHttpUrl(u) &&
+            !isLikelyVideoUrl(u) &&
+            !isLikelyBlockedVisionUrl(u)
+        )
+        .slice(0, perPost);
+      const descs = (t.imageDescriptions || []).slice(0, perPost);
+      return {
+        mainText: trunc(t.mainText),
+        quotedText: trunc(t.quotedText),
+        quotedAuthor: t.quotedAuthor ?? '',
+        authorUsername: t.authorUsername,
+        tweetUrl: t.tweetUrl,
+        quotedUrl: t.quotedUrl ?? '',
+        tweetId: t.tweetId,
+        sourcePlatform: t.sourcePlatform || 'twitter',
+        imageUrls,
+        ...(descs.length > 0 ? { imageDescriptions: descs } : {}),
+      };
+    })
   );
+
+  const visionBlock =
+    visionUrls.length > 0
+      ? `## VISION (multimodal)
+This message includes ${visionUrls.length} image attachment(s) appended after the text in strict per-post order: all images for post[0] first (in imageUrls order), then all images for post[1], and so on, up to the global cap. A post with an empty imageUrls contributes zero attachments; the next attachment belongs to the next post that has imageUrls. Use visible text, charts, screenshots, and headlines in images together with mainText and quotedText. If an image fails to load, rely on text fields only. Note: a post may have imageDescriptions but no imageUrls — in that case imageDescriptions are the sole media context and must be used.
+
+`
+      : '';
 
   const contextBlock =
     context && context.trim()
       ? `${context.trim()}\n\n`
       : '';
 
-  return `${ONE_STORY_RULE}\n\n${contextBlock}You are a CRYPTO MARKET breaking-news detector. Focus ONLY on news that can realistically move cryptocurrency prices in the next 0–48 hours.
+  return `${ONE_STORY_RULE}\n\n${contextBlock}${visionBlock}You are a CRYPTO MARKET breaking-news detector. Focus ONLY on news that can realistically move cryptocurrency prices in the next 0–48 hours.
 
-Here are new tweets from accounts I follow:
+Here are new posts from monitored accounts (Twitter and/or Truth Social):
 ${tweetsJson}
 
-Each tweet object contains:
+Each input object contains:
+- sourcePlatform: "twitter" or "truth-social" (where the post was published)
 - mainText: The author's own words/reaction
 - quotedText: Content they're quoting (if any)
 - quotedAuthor: Who they're quoting
-- authorUsername: The main tweet author
-- tweetUrl: Link to the main tweet
-- quotedUrl: Link to the quoted tweet (if any)
-- tweetId: The tweet ID
+- authorUsername: The main author handle
+- tweetUrl: Link to the post (Twitter or Truth Social)
+- quotedUrl: Link to the quoted post (if any)
+- tweetId: Unique id (Truth Social ids are prefixed ts_)
+- imageUrls: Public http(s) image URLs safe for vision (Linode archive, Twitter CDN, etc.; Truth Social static-asset URLs are omitted because they often 403 externally)
+- imageDescriptions: Optional text captions from trumpstruth.org for Truth Social attachments — use these as ground truth for embedded screenshots/media when imageUrls are missing or fail to load
 
 Your Task:
-For EACH tweet, create ONE JSON object with:
+For EACH post (same order as input), create ONE JSON object with:
 1. "summary": 1-2 sentence summary (combine mainText + quotedText context if both exist)
 2. "breaking": Array (0 or 1 items) for breaking news
 
 Breaking News Criteria:
-A tweet is breaking news ONLY if it meets ALL THREE conditions:
+A post is breaking news ONLY if it meets ALL THREE conditions:
 1. Urgent, new, and time-sensitive
-2. CONFIRMED event (not "said to", "reportedly", "sources say" unless confirmed by official statement, direct quote from authority, OR reported by major credible outlets (Bloomberg/Reuters/WSJ/FT) and clearly market-moving)
+2. CONFIRMED event — passes ONE of these bars:
+   (a) Primary-source confirmation: official statement, direct quote from authority, or the author IS the primary source (e.g. a president posting directly).
+   (b) Major outlet (Bloomberg/Reuters/WSJ/FT) explicitly states the event HAS happened — not "is considering", "in talks", or "sources say". A post merely quoting or linking Bloomberg does NOT count; the Bloomberg/Reuters report itself must describe a completed fact.
+   Anything else ("reportedly", "sources say", "said to", rumours, speculation) = NOT confirmed = NOT breaking.
 3. Falls into ONE of these categories that can realistically move BTC/ETH within 0–48h:
 
 Web3/Crypto (any ONE of these):
@@ -99,12 +171,13 @@ Web3/Crypto (any ONE of these):
 
 Macro/Markets (breaking ONLY if confirmed AND likely to move BTC/ETH within 0–48h):
 
-PRIORITY: Major equity index regime shifts (Nasdaq/S&P500)
-- Large confirmed moves that signal risk-on/risk-off regime shifts
-- Examples: "biggest daily gain/loss since [date]", "records biggest daily percentage gain", ≥2% intraday moves
-- These moves often correlate with crypto direction within 0-48h
-- Urgency: "medium" for regime shift signals (even if exact % not stated), "high" for ≥5% crashes
-- IMPORTANT: If a tweet reports a confirmed major equity index move (especially "biggest since" or "records" language), treat it as breaking - these are market structure signals, not just stock news
+PRIORITY: Major equity index regime shifts (S&P500 or Nasdaq100 only)
+- Breaking if EITHER condition is met (confirmed by credible outlet or primary data):
+  • Index is up or down ≥2% on the day (intraday or close).
+  • Post uses "biggest daily move/gain/loss since [date]" language for S&P500 or Nasdaq100.
+- Urgency: "medium" for ≥2% / "biggest since" signals; "high" for ≥5% crashes.
+- These are market-structure signals that correlate with crypto direction within 0–48h — prioritise over the general "stock news" exclusion.
+- NOT breaking: moves <2% with no "biggest since" language, individual sector or single-stock moves (Apple, Tesla, etc.).
 
 Other Macro/Markets (breaking if confirmed):
 - Rates shock: clear catalyst that can move US 2Y / 10Y yields
@@ -155,17 +228,17 @@ Output ONLY strict JSON:
 
 Rules:
 - If NOT breaking: "breaking": []
-- PRIORITY RULE: Major equity index moves (Nasdaq/S&P500) that signal regime shifts are breaking - prioritize these over "general stock market news" exclusion
-- BE STRICT for everything else: When in doubt, it's NOT breaking
-- CRYPTO FOCUS: If it doesn't affect crypto prices, it's NOT breaking
-- CONFIRMED ONLY: Must be actual event, not rumors or unconfirmed reports (except major credible outlets: Bloomberg/Reuters/WSJ/FT if clearly market-moving)
-- tweet_id MUST equal the input tweetId exactly (use the tweetId field from the input tweet object)
-- Analyze BOTH mainText AND quotedText together for context
-- For quotes, include BOTH mainText and quotedText in breaking object
-- impact_line: one short sentence only (used for context later); no long explanation
-- NO markdown, NO code blocks, NO explanations
-- MUST be valid JSON
-- Same order as input
+- breaking MUST contain at most 1 object — never output more than one item in the array.
+- PRIORITY: S&P500/Nasdaq100 ≥2% moves or "biggest since" are breaking (see equity rule above).
+- BE STRICT for everything else: when in doubt, it's NOT breaking.
+- CRYPTO FOCUS: if it doesn't affect crypto prices, it's NOT breaking.
+- CONFIRMED ONLY: apply the confirmation standard above; quoting or linking a credible outlet is NOT enough — the outlet must describe a completed fact.
+- tweet_id MUST equal the input tweetId exactly.
+- Analyze BOTH mainText AND quotedText together for context; include both in the breaking object when a quote is present.
+- imageDescriptions should be treated as ground-truth captions for attached media even when imageUrls is empty.
+- impact_line: one short sentence only; no long explanation.
+- Output ONLY valid JSON: double quotes for all keys and strings, no trailing commas, no markdown, no code fences, no extra text.
+- Same order as input.
 `.trim();
 }
 
@@ -177,7 +250,19 @@ export async function analyzeTweetsWithGrok(
     throw new Error('GROK_API_KEY is not set');
   }
 
-  const prompt = buildPrompt(tweets, context);
+  const visionUrls = collectVisionImageUrls(tweets);
+  const prompt = buildPrompt(tweets, context, visionUrls);
+
+  const userContent: string | ChatContentPart[] =
+    visionUrls.length > 0
+      ? [
+          { type: 'text', text: prompt },
+          ...visionUrls.map((url) => ({
+            type: 'image_url' as const,
+            image_url: { url, detail: 'high' as const },
+          })),
+        ]
+      : prompt;
 
    // Optional sampling controls (match n8n settings if you know them)
   const temperature =
@@ -196,7 +281,7 @@ export async function analyzeTweetsWithGrok(
       messages: [
         {
           role: 'user',
-          content: prompt,
+          content: userContent,
         },
       ],
       ...(temperature !== undefined ? { temperature } : {}),

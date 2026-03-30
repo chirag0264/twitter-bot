@@ -1,5 +1,7 @@
 import { config } from './config';
 
+export type SourcePlatform = 'twitter' | 'truth-social';
+
 export interface NormalizedTweet {
   timestamp: string;
   tweetId: string;
@@ -11,6 +13,8 @@ export interface NormalizedTweet {
   hasQuote: boolean;
   images: string[];
   imageCount: number;
+  /** trumpstruth.org archive captions for attachments (Truth Social ingest); use when vision URLs are blocked */
+  imageDescriptions?: string[];
   authorUsername: string;
   authorName: string;
   authorFollowers: number;
@@ -34,6 +38,8 @@ export interface NormalizedTweet {
   eventType: string;
   processed: boolean;
   ingestedAt: string;
+  /** twitter = API search; truth-social = RSS ingest. Omitted on legacy docs = treat as twitter */
+  sourcePlatform?: SourcePlatform;
 }
 
 interface RawTweet {
@@ -149,6 +155,7 @@ export function normalizeTweetsFromSearch(data: {
       eventType,
       processed: false,
       ingestedAt: nowISO,
+      sourcePlatform: 'twitter',
     };
   });
 }
