@@ -6,6 +6,8 @@ export interface NormalizedTweet {
   timestamp: string;
   tweetId: string;
   tweetUrl: string;
+  /** Canonical Truth Social post ID when known from archive status page. */
+  originalTruthId?: string;
   mainText: string;
   quotedText: string;
   quotedAuthor: string;
@@ -37,6 +39,8 @@ export interface NormalizedTweet {
   ruleValue: string;
   eventType: string;
   processed: boolean;
+  /** false = media post waiting for archive enrichment before Grok analysis */
+  enriched?: boolean;
   ingestedAt: string;
   /** twitter = API search; truth-social = RSS ingest. Omitted on legacy docs = treat as twitter */
   sourcePlatform?: SourcePlatform;

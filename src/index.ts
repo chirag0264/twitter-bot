@@ -1,8 +1,10 @@
 import { getDb } from './mongo';
 import { runPullTweetsOnce } from './pullTweetsJob';
-import { runTruthSocialIngestOnce } from './truthSocialIngestJob';
+import { runTruthSocialIngestWithFallback } from './civicTrackerIngestJob';
 import { runSilentWatchdogOnce } from './silentWatchdogJob';
 import { runSlowPathOnce } from './slowPathJob';
+import { runArchiveEnrichOnce } from './archiveEnrichJob';
+import { runTruthSocialAnalysisOnce } from './truthSocialAnalysisJob';
 import cron from 'node-cron';
 import { config } from './config';
 
@@ -19,13 +21,15 @@ async function main() {
   // Run immediately once on startup
   await runPullTweetsOnce();
   try {
-    await runTruthSocialIngestOnce();
+    await runTruthSocialIngestWithFallback();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[twitter-bot] Truth Social ingest on startup:', err);
   }
+  await runArchiveEnrichOnce();
   await runSilentWatchdogOnce();
   await runSlowPathOnce();
+  await runTruthSocialAnalysisOnce();
 
   // Schedule fast path (pull tweets) + watchdog on CRON_INTERVAL_MINUTES
   const fastPathMinutes = Math.max(1, Math.floor(config.cronIntervalMinutes || 3));
@@ -67,19 +71,52 @@ async function main() {
 
   const truthMinutes = Math.max(
     1,
-    Math.floor(config.truthSocialPollMinutes || 5)
+    Math.floor(config.truthSocialPollMinutes || 3)
   );
   const truthExpr = `*/${truthMinutes} * * * *`;
   console.log(
-    `[scheduler] Truth Social RSS ingest: every ${truthMinutes} minute(s) - "${truthExpr}"`
+    `[scheduler] Truth Social ingest (CivicTracker primary / RSS fallback): every ${truthMinutes} minute(s) - "${truthExpr}"`
   );
 
   cron.schedule(truthExpr, async () => {
     try {
-      await runTruthSocialIngestOnce();
+      await runTruthSocialIngestWithFallback();
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[scheduler] Error in Truth Social ingest:', err);
+    }
+  });
+
+  // Archive enrichment: runs slightly more often than ingest so media posts get
+  // descriptions before the analysis job picks them up.
+  const enrichMinutes = Math.max(1, Math.min(truthMinutes, 3));
+  const enrichExpr = `*/${enrichMinutes} * * * *`;
+  console.log(
+    `[scheduler] Archive enrichment: every ${enrichMinutes} minute(s) - "${enrichExpr}"`
+  );
+
+  cron.schedule(enrichExpr, async () => {
+    try {
+      await runArchiveEnrichOnce();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[scheduler] Error in archive enrich:', err);
+    }
+  });
+
+  // Truth Social analysis: separate from Twitter slow-path
+  const tsAnalysisMinutes = Math.max(1, Math.floor(config.slowPathIntervalMinutes || 2));
+  const tsAnalysisExpr = `*/${tsAnalysisMinutes} * * * *`;
+  console.log(
+    `[scheduler] Truth Social analysis: every ${tsAnalysisMinutes} minute(s) - "${tsAnalysisExpr}"`
+  );
+
+  cron.schedule(tsAnalysisExpr, async () => {
+    try {
+      await runTruthSocialAnalysisOnce();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[scheduler] Error in Truth Social analysis:', err);
     }
   });
 

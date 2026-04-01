@@ -24,6 +24,10 @@ export interface AlertRow {
   Link: string;
   QuotedLink: string;
   HasQuote: boolean;
+  AlertType?: 'breaking' | 'commentary';
+  Summary?: string;
+  Classification?: string;
+  MarketRelevance?: number;
   /** Deterministic server-side dedupe keys (optional). */
   DeterministicKeys?: string[];
   /** Set by slow path from source tweet; drives Telegram routing */

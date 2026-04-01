@@ -11,8 +11,7 @@ type TweetDoc = NormalizedTweet & {
 };
 
 function isPriorityTag(tag?: string): boolean {
-  const lower = (tag || '').toLowerCase();
-  return lower.includes('priority');
+  return (tag || '').toLowerCase().includes('priority');
 }
 
 function buildContextBlock(
@@ -68,8 +67,9 @@ export async function runSlowPathOnce(): Promise<void> {
   const analysesCol = db.collection('analyses');
   const alertsCol = db.collection<AlertRow>('alerts');
 
+  // Twitter only — Truth Social is handled by truthSocialAnalysisJob
   const allItems = await tweetsCol
-    .find({ processed: false })
+    .find({ processed: false, sourcePlatform: { $ne: 'truth-social' } })
     .sort({ ruleTag: 1, ingestedAt: -1 })
     .limit(50)
     .toArray();
@@ -168,27 +168,32 @@ export async function runSlowPathOnce(): Promise<void> {
   const allBreakingArrays: any[][] = [];
   const analyzedTweetIds = new Set<string>();
 
-  const idToPlatform = new Map<string, 'twitter' | 'truth-social'>();
-  for (const t of limited) {
-    idToPlatform.set(
-      t.tweetId,
-      t.sourcePlatform === 'truth-social' ? 'truth-social' : 'twitter'
-    );
-  }
-
   for (const batch of batches) {
-    const batchTweets = batch.map((t) => t as NormalizedTweet);
+    const tweets = batch.map((t) => t as NormalizedTweet);
+    batch.forEach((t) => t.tweetId && analyzedTweetIds.add(t.tweetId));
 
-    batch.forEach((t) => {
-      if (t.tweetId) analyzedTweetIds.add(t.tweetId);
-    });
-
-    const rawResponse = await analyzeTweetsWithGrok(batchTweets, liveContext);
+    const batchBreakingItems: any[] = [];
+    const rawResponse = await analyzeTweetsWithGrok(tweets, liveContext);
     const parsed = parseGrokResponse(rawResponse);
-    allBreakingArrays.push(parsed.breaking);
 
-    // Feed newly found alerts back into context so later batches avoid repeats.
-    const batchAlerts = flattenBreakingItems([parsed.breaking]).map((a) => ({
+    allBreakingArrays.push(parsed.breaking);
+    batchBreakingItems.push(...parsed.breaking);
+
+    try {
+      await analysesCol.insertOne({
+        createdAt: new Date().toISOString(),
+        tweetIds: tweets.map((t) => t.tweetId),
+        sourcePlatform: 'twitter',
+        results: parsed.results,
+        breaking: parsed.breaking,
+        raw: rawResponse,
+      });
+    } catch (err) {
+      console.error('[slow-path] Failed to store analysis:', (err as Error).message);
+    }
+
+    // Feed newly found breaking items back into context for later batches.
+    const batchAlerts = flattenBreakingItems([batchBreakingItems]).map((a) => ({
       MainText: a.MainText,
       ImpactLine: a.ImpactLine,
     }));
@@ -196,141 +201,85 @@ export async function runSlowPathOnce(): Promise<void> {
       withinRunAlerts.push(...batchAlerts);
       liveContext = buildContextBlock([...withinRunAlerts, ...recentAlerts]);
     }
-
-    // Persist analysis for debug/inspection
-    try {
-      await analysesCol.insertOne({
-        createdAt: new Date().toISOString(),
-        tweetIds: batchTweets.map((t) => t.tweetId),
-        sourcePlatforms: batchTweets.map(
-          (t) => t.sourcePlatform || 'twitter'
-        ),
-        results: parsed.results,
-        breaking: parsed.breaking,
-        raw: rawResponse,
-      });
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(
-        '[slow-path] Failed to insert analysis document:',
-        (err as Error).message
-      );
-    }
   }
 
-  const alerts: AlertRow[] = flattenBreakingItems(allBreakingArrays);
-  for (const a of alerts) {
-    a.SourcePlatform = idToPlatform.get(a.TweetId) || 'twitter';
-  }
+  let alerts: AlertRow[] = flattenBreakingItems(allBreakingArrays);
+  alerts.forEach((a) => {
+    a.SourcePlatform = 'twitter';
+    a.AlertType = 'breaking';
+  });
 
-  // Cross-run dedup: only insert and send alerts not already in DB
-  let deduped = alerts;
+  // Cross-run dedup by TweetId
   if (alerts.length > 0) {
-    const newAlertTweetIds = alerts.map((a) => a.TweetId);
+    const ids = alerts.map((a) => a.TweetId);
     const existing = await alertsCol
-      .find({ TweetId: { $in: newAlertTweetIds } })
+      .find({ TweetId: { $in: ids } })
       .project({ TweetId: 1 })
       .toArray();
     const existingIds = new Set(existing.map((e) => e.TweetId));
-    deduped = alerts.filter((a) => !existingIds.has(a.TweetId));
-    if (deduped.length < alerts.length) {
-      console.log(
-        `[slow-path] Skipping ${alerts.length - deduped.length} alerts already sent (cross-run dedup)`
-      );
+    const before = alerts.length;
+    alerts = alerts.filter((a) => !existingIds.has(a.TweetId));
+    if (alerts.length < before) {
+      console.log(`[slow-path] Skipped ${before - alerts.length} already-sent alert(s)`);
     }
   }
 
-  // Deterministic dedup for same-day major equity crash stories across accounts.
-  if (deduped.length > 0) {
-    for (const a of deduped) {
+  // Deterministic same-day equity crash dedup
+  if (alerts.length > 0) {
+    alerts.forEach((a) => {
       a.DeterministicKeys = buildDeterministicKeys(a);
-    }
+    });
     const candidateKeys = Array.from(
-      new Set(deduped.flatMap((a) => a.DeterministicKeys || []))
+      new Set(alerts.flatMap((a) => a.DeterministicKeys || []))
     );
     if (candidateKeys.length > 0) {
-      const existingByKey = await alertsCol
+      const existingByKey = (await alertsCol
         .find({ DeterministicKeys: { $in: candidateKeys } })
         .project({ DeterministicKeys: 1 })
-        .toArray() as { DeterministicKeys?: string[] }[];
+        .toArray()) as { DeterministicKeys?: string[] }[];
       const seenKeys = new Set<string>(
         existingByKey.flatMap((e) => e.DeterministicKeys || [])
       );
       const kept: AlertRow[] = [];
-      for (const a of deduped) {
+      for (const a of alerts) {
         const keys = a.DeterministicKeys || [];
-        if (keys.length > 0 && keys.some((k) => seenKeys.has(k))) {
-          continue;
-        }
+        if (keys.length > 0 && keys.some((k) => seenKeys.has(k))) continue;
         kept.push(a);
-        for (const k of keys) seenKeys.add(k);
+        keys.forEach((k) => seenKeys.add(k));
       }
-      if (kept.length < deduped.length) {
+      if (kept.length < alerts.length) {
         console.log(
-          `[slow-path] Skipping ${deduped.length - kept.length} alerts by deterministic same-day equity dedupe`
+          `[slow-path] Skipped ${alerts.length - kept.length} alert(s) by deterministic equity dedup`
         );
       }
-      deduped = kept;
+      alerts = kept;
     }
   }
 
-  if (deduped.length > 0) {
-    await alertsCol.insertMany(deduped, { ordered: false });
+  if (alerts.length > 0) {
+    await alertsCol.insertMany(alerts, { ordered: false });
 
-    for (const a of deduped) {
-      const chatId =
-        a.SourcePlatform === 'truth-social'
-          ? config.telegramTruthSocialChatId
-          : config.telegramAlertChatId;
-
+    const chatId = config.telegramAlertChatId;
+    for (const a of alerts) {
       if (!chatId) {
-        console.warn(
-          `[slow-path] No Telegram chat for platform ${a.SourcePlatform || 'twitter'}; skipping send`
-        );
-        continue;
+        console.warn('[slow-path] TELEGRAM_ALERT_CHAT_ID not set — skipping send');
+        break;
       }
 
-      const icon =
-        a.Urgency === 'high'
-          ? '🔴'
-          : a.Urgency === 'medium'
-          ? '🟡'
-          : '🟢';
-
-      const textLines: string[] = [];
-      if (a.SourcePlatform === 'truth-social') {
-        textLines.push('📣 <b>Truth Social</b>', '');
-      }
-      textLines.push(`${icon} ${a.MainText}`);
+      const icon = a.Urgency === 'high' ? '🔴' : a.Urgency === 'medium' ? '🟠' : '🟢';
+      const lines: string[] = [`${icon} ${a.MainText}`];
 
       if (a.HasQuote && a.QuotedText) {
-        textLines.push(
-          '',
-          `📎 <b>Quoting @${a.QuotedAuthor}:</b>`,
-          a.QuotedText
-        );
+        lines.push('', `📎 <b>Quoting @${a.QuotedAuthor}:</b>`, a.QuotedText);
       }
 
-      textLines.push(
-        '',
-        `👤 @${a.Username}`,
-        '',
-        `🔗 ${a.Link}`
-      );
+      lines.push('', `👤 @${a.Username}`, '', `🔗 ${a.Link}`);
+      if (a.QuotedLink) lines.push(`📎 ${a.QuotedLink}`);
 
-      if (a.QuotedLink) {
-        textLines.push(`📎 ${a.QuotedLink}`);
-      }
-
-      const message = textLines.join('\n');
-
-      await sendTelegramMessage({
-        chatId,
-        text: message,
-      });
+      await sendTelegramMessage({ chatId, text: lines.join('\n') });
     }
   } else {
-    console.log('No breaking alerts to send');
+    console.log('[slow-path] No breaking alerts to send');
   }
 
   if (analyzedTweetIds.size > 0) {
@@ -338,9 +287,7 @@ export async function runSlowPathOnce(): Promise<void> {
       { tweetId: { $in: Array.from(analyzedTweetIds) } },
       { $set: { processed: true, processedAt: new Date().toISOString() } }
     );
-    console.log(
-      `Marked ${analyzedTweetIds.size} tweets as processed in Mongo`
-    );
+    console.log(`[slow-path] Marked ${analyzedTweetIds.size} tweet(s) as processed`);
   }
 }
 

@@ -158,7 +158,12 @@ function filterRasterImageUrls(urls: string[]): string[] {
   return [...new Set(urls)].filter((u) => !isVideoAttachmentUrl(u));
 }
 
-type StatusPageData = { images: string[]; imageDescriptions: string[] };
+type StatusPageData = {
+  images: string[];
+  imageDescriptions: string[];
+  originalTruthId?: string;
+  originalTruthUrl?: string;
+};
 
 /**
  * Parse trumpstruth.org status HTML: public Linode archive image URLs + archive "Image Description" text.
@@ -206,7 +211,18 @@ async function fetchStatusPageData(postUrl: string): Promise<StatusPageData> {
       }
     }
 
-    return { images: [...urls], imageDescriptions: descriptions };
+    const originalTruthId =
+      html.match(/TRUTH Social status ID[\s\S]{0,200}?<code>(\d+)<\/code>/i)?.[1] ||
+      html.match(/truthsocial\.com\/@[^/]+\/(\d+)/i)?.[1];
+    const originalTruthUrl =
+      html.match(/<a href="(https:\/\/truthsocial\.com\/@[^"]+\/\d+)" target="_blank">/i)?.[1];
+
+    return {
+      images: [...urls],
+      imageDescriptions: descriptions,
+      ...(originalTruthId ? { originalTruthId } : {}),
+      ...(originalTruthUrl ? { originalTruthUrl } : {}),
+    };
   } catch (e) {
     console.warn(`[truth-social] Status page fetch failed ${postUrl}:`, e);
     return { images: [], imageDescriptions: [] };
@@ -217,6 +233,7 @@ type TruthRssFields = {
   tweetId: string;
   tweetUrl: string;
   postUrl: string;
+  originalTruthId?: string;
   title: string;
   descRaw: string;
   contentEncoded: string;
@@ -276,6 +293,7 @@ function buildTruthTweetFromFields(
     timestamp: nowISO,
     tweetId: fields.tweetId,
     tweetUrl: fields.tweetUrl,
+    ...(fields.originalTruthId ? { originalTruthId: fields.originalTruthId } : {}),
     mainText,
     quotedText: '',
     quotedAuthor: '',
@@ -334,9 +352,21 @@ async function enrichFromStatusPages(fieldsList: TruthRssFields[]): Promise<void
     const chunk = toFetch.slice(i, i + STATUS_PAGE_FETCH_CONCURRENCY);
     await Promise.all(
       chunk.map(async (f) => {
-        const { images: pageUrls, imageDescriptions } = await fetchStatusPageData(
+        const {
+          images: pageUrls,
+          imageDescriptions,
+          originalTruthId,
+          originalTruthUrl,
+        } = await fetchStatusPageData(
           f.postUrl
         );
+        if (originalTruthId) {
+          f.originalTruthId = originalTruthId;
+          f.tweetId = `ts_${originalTruthId}`;
+        }
+        if (originalTruthUrl) {
+          f.tweetUrl = originalTruthUrl;
+        }
         const pageRaster = filterRasterImageUrls(pageUrls);
         f.images = filterRasterImageUrls([
           ...new Set([...f.images, ...pageRaster]),
@@ -394,6 +424,47 @@ export async function runTruthSocialIngestOnce(): Promise<void> {
     return;
   }
 
-  const inserted = await deduplicateAndInsert(tweets);
-  console.log(`[truth-social] Inserted ${inserted} new Truth Social post(s) into tweets`);
+  const db = await getDb();
+  const tweetsCol = db.collection<NormalizedTweet>('tweets');
+
+  let updatedMainRows = 0;
+  const rssFallbackInserts: NormalizedTweet[] = [];
+
+  for (const tweet of tweets) {
+    const existingMain = await tweetsCol.findOne({
+      tweetId: tweet.tweetId,
+      source: 'civictracker-truth-social',
+    });
+
+    if (existingMain) {
+      const setPayload: Partial<NormalizedTweet> = {
+        tweetUrl: tweet.tweetUrl,
+        ...(tweet.originalTruthId ? { originalTruthId: tweet.originalTruthId } : {}),
+        ...(tweet.images.length > 0 ? { images: tweet.images, imageCount: tweet.imageCount } : {}),
+        ...(tweet.imageDescriptions && tweet.imageDescriptions.length > 0
+          ? { imageDescriptions: tweet.imageDescriptions }
+          : {}),
+        ...(tweet.mainText &&
+        tweet.mainText !== `[Media-only post (no text in RSS mirror) — open link] ${tweet.tweetUrl}`
+          ? { mainText: tweet.mainText }
+          : {}),
+      };
+
+      if (Object.keys(setPayload).length > 0) {
+        await tweetsCol.updateOne(
+          { _id: (existingMain as any)._id },
+          { $set: setPayload }
+        );
+        updatedMainRows += 1;
+      }
+      continue;
+    }
+
+    rssFallbackInserts.push(tweet);
+  }
+
+  const inserted = await deduplicateAndInsert(rssFallbackInserts);
+  console.log(
+    `[truth-social] RSS handled ${tweets.length} post(s): updated ${updatedMainRows} CivicTracker row(s), inserted ${inserted} fallback RSS row(s)`
+  );
 }
